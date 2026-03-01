@@ -4,8 +4,13 @@ namespace LazyTracker.Core;
 
 /// <summary>
 /// Watches the webcam for face presence using OpenCV Haar cascade detection.
-/// Raises the <see cref="LookedAway"/> event when no frontal face is detected
-/// for longer than the configured threshold.
+/// Detects two scenarios:
+///   1. Face gone — user turned away or left the desk
+///   2. Looking down — face detected but shifted significantly downward
+///      from the baseline position (phone usage)
+/// 
+/// Uses face POSITION tracking instead of eye detection for the "looking down"
+/// signal, which is far more reliable than Haar cascade eye detection.
 /// 
 /// This class is fully cross-platform — it only depends on OpenCvSharp4
 /// and the appropriate platform runtime package.
@@ -18,12 +23,19 @@ public sealed class FaceWatcher : IDisposable
     private VideoCapture? _capture;
     private Timer? _timer;
     private DateTime _lastFaceSeen;
+    private DateTime _lastAttentiveTime;
     private DateTime _lastTriggerTime;
     private int _totalTriggers;
     private bool _isRunning;
     private bool _isPaused;
     private bool _disposed;
     private readonly object _lock = new();
+    private int _frameHeight;
+
+    // Face position baseline tracking
+    private double _baselineFaceCenterY = -1;
+    private readonly Queue<double> _recentFaceCenterYs = new();
+    private int _baselineWindowSize;
 
     /// <summary>
     /// Fired when the user has been looking away longer than the threshold.
@@ -49,12 +61,11 @@ public sealed class FaceWatcher : IDisposable
         _options = options ?? throw new ArgumentNullException(nameof(options));
 
         // Load Haar cascade for frontal face detection
-        var cascadePath = FindCascadePath();
-        _faceCascade = new CascadeClassifier(cascadePath);
-
+        var faceCascadePath = FindCascadePath("haarcascade_frontalface_default.xml");
+        _faceCascade = new CascadeClassifier(faceCascadePath);
         if (_faceCascade.Empty())
             throw new FileNotFoundException(
-                $"Failed to load Haar cascade from: {cascadePath}");
+                $"Failed to load face cascade from: {faceCascadePath}");
     }
 
     /// <summary>
@@ -79,9 +90,15 @@ public sealed class FaceWatcher : IDisposable
             // Set a modest resolution — we don't need HD for face detection
             _capture.Set(VideoCaptureProperties.FrameWidth, 640);
             _capture.Set(VideoCaptureProperties.FrameHeight, 480);
+            _frameHeight = (int)_capture.Get(VideoCaptureProperties.FrameHeight);
+            if (_frameHeight <= 0) _frameHeight = 480;
 
             _lastFaceSeen = DateTime.UtcNow;
+            _lastAttentiveTime = DateTime.UtcNow;
             _lastTriggerTime = DateTime.MinValue;
+            _baselineFaceCenterY = -1;
+            _recentFaceCenterYs.Clear();
+            _baselineWindowSize = Math.Max(5, _options.DetectionFps * 3); // 3 seconds of baseline
             _isRunning = true;
             _isPaused = false;
 
@@ -124,7 +141,10 @@ public sealed class FaceWatcher : IDisposable
     public void Resume()
     {
         _isPaused = false;
-        _lastFaceSeen = DateTime.UtcNow; // Reset timer so user isn't immediately punished
+        _lastFaceSeen = DateTime.UtcNow;
+        _lastAttentiveTime = DateTime.UtcNow;
+        _baselineFaceCenterY = -1;
+        _recentFaceCenterYs.Clear();
         StatusChanged?.Invoke(this, new FaceDetectionStatus
         {
             FaceDetected = true,
@@ -155,7 +175,7 @@ public sealed class FaceWatcher : IDisposable
                 var faces = _faceCascade.DetectMultiScale(
                     image: gray,
                     scaleFactor: 1.1,
-                    minNeighbors: 5,
+                    minNeighbors: 4,
                     flags: HaarDetectionTypes.ScaleImage,
                     minSize: new Size(_options.MinFaceSize, _options.MinFaceSize));
 
@@ -165,39 +185,111 @@ public sealed class FaceWatcher : IDisposable
                 if (faceFound)
                 {
                     _lastFaceSeen = now;
-                    StatusChanged?.Invoke(this, new FaceDetectionStatus
+
+                    // Get the largest face (most likely the user)
+                    var face = faces.OrderByDescending(f => f.Width * f.Height).First();
+                    double faceCenterY = face.Y + face.Height / 2.0;
+
+                    // Normalize to frame height (0.0 = top, 1.0 = bottom)
+                    double normalizedY = faceCenterY / _frameHeight;
+
+                    // Track position for baseline calculation
+                    _recentFaceCenterYs.Enqueue(normalizedY);
+                    while (_recentFaceCenterYs.Count > _baselineWindowSize)
+                        _recentFaceCenterYs.Dequeue();
+
+                    // Establish baseline from the median of recent positions
+                    // (median is more robust to outliers than mean)
+                    if (_baselineFaceCenterY < 0 && _recentFaceCenterYs.Count >= 5)
                     {
-                        FaceDetected = true,
-                        State = WatcherState.Watching,
-                        SecondsAway = 0
-                    });
+                        _baselineFaceCenterY = GetMedian(_recentFaceCenterYs);
+                    }
+
+                    // Check if face has shifted significantly downward
+                    bool isLookingDown = false;
+                    if (_baselineFaceCenterY > 0)
+                    {
+                        double dropAmount = normalizedY - _baselineFaceCenterY;
+                        // Drop threshold as % of frame height (default 0.12 = ~58px in 480p)
+                        isLookingDown = dropAmount > _options.FaceDropThreshold;
+
+                        // Slowly adapt baseline upward if face is at or above baseline
+                        // (handles user shifting in chair over time)
+                        if (!isLookingDown)
+                        {
+                            _baselineFaceCenterY = _baselineFaceCenterY * 0.98 + normalizedY * 0.02;
+                        }
+                    }
+
+                    if (!isLookingDown)
+                    {
+                        _lastAttentiveTime = now;
+                        StatusChanged?.Invoke(this, new FaceDetectionStatus
+                        {
+                            FaceDetected = true,
+                            IsLookingDown = false,
+                            State = WatcherState.Watching,
+                            SecondsAway = 0
+                        });
+                    }
+                    else
+                    {
+                        var secondsDown = (now - _lastAttentiveTime).TotalSeconds;
+
+                        StatusChanged?.Invoke(this, new FaceDetectionStatus
+                        {
+                            FaceDetected = true,
+                            IsLookingDown = true,
+                            State = WatcherState.Watching,
+                            SecondsAway = secondsDown
+                        });
+
+                        if (secondsDown >= _options.LookingDownThresholdSeconds)
+                        {
+                            var sinceTrigger = (now - _lastTriggerTime).TotalSeconds;
+                            if (sinceTrigger >= _options.CooldownSeconds)
+                            {
+                                _totalTriggers++;
+                                _lastTriggerTime = now;
+                                _lastAttentiveTime = now;
+
+                                LookedAway?.Invoke(this, new LookedAwayEventArgs
+                                {
+                                    SecondsAway = secondsDown,
+                                    TotalTriggers = _totalTriggers,
+                                    Reason = LookAwayReason.LookingDown
+                                });
+                            }
+                        }
+                    }
                 }
                 else
                 {
+                    // No face at all — turned away or left
                     var secondsAway = (now - _lastFaceSeen).TotalSeconds;
 
                     StatusChanged?.Invoke(this, new FaceDetectionStatus
                     {
                         FaceDetected = false,
+                        IsLookingDown = false,
                         State = WatcherState.Watching,
                         SecondsAway = secondsAway
                     });
 
-                    // Check if we've exceeded the threshold
                     if (secondsAway >= _options.LookAwayThresholdSeconds)
                     {
-                        // Check cooldown
                         var sinceTrigger = (now - _lastTriggerTime).TotalSeconds;
                         if (sinceTrigger >= _options.CooldownSeconds)
                         {
                             _totalTriggers++;
                             _lastTriggerTime = now;
-                            _lastFaceSeen = now; // Reset so we don't immediately re-trigger
+                            _lastFaceSeen = now;
 
                             LookedAway?.Invoke(this, new LookedAwayEventArgs
                             {
                                 SecondsAway = secondsAway,
-                                TotalTriggers = _totalTriggers
+                                TotalTriggers = _totalTriggers,
+                                Reason = LookAwayReason.FaceGone
                             });
                         }
                     }
@@ -211,9 +303,17 @@ public sealed class FaceWatcher : IDisposable
         }
     }
 
-    private static string FindCascadePath()
+    private static double GetMedian(Queue<double> values)
     {
-        const string cascadeFileName = "haarcascade_frontalface_default.xml";
+        var sorted = values.OrderBy(v => v).ToArray();
+        int mid = sorted.Length / 2;
+        return sorted.Length % 2 == 0
+            ? (sorted[mid - 1] + sorted[mid]) / 2.0
+            : sorted[mid];
+    }
+
+    private static string FindCascadePath(string cascadeFileName)
+    {
 
         // 1. Try file on disk first (for non-single-file or dev scenarios)
         var candidates = new[]
@@ -269,8 +369,21 @@ public sealed class FaceWatcher : IDisposable
 public sealed class FaceDetectionStatus
 {
     public bool FaceDetected { get; init; }
+    public bool IsLookingDown { get; init; }
     public WatcherState State { get; init; }
     public double SecondsAway { get; init; }
+}
+
+/// <summary>
+/// Why the user was detected as not paying attention.
+/// </summary>
+public enum LookAwayReason
+{
+    /// <summary>Face left the frame entirely (turned away, left desk).</summary>
+    FaceGone,
+
+    /// <summary>Face dropped significantly below baseline position (looking at phone).</summary>
+    LookingDown
 }
 
 /// <summary>

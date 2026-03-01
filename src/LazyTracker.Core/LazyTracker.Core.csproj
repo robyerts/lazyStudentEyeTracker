@@ -18,6 +18,9 @@
     <EmbeddedResource Include="Resources\haarcascade_frontalface_default.xml">
       <LogicalName>haarcascade_frontalface_default.xml</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="Resources\haarcascade_eye_tree_eyeglasses.xml">
+      <LogicalName>haarcascade_eye_tree_eyeglasses.xml</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
 </Project>

@@ -37,4 +37,18 @@ public sealed class LazyTrackerOptions
     /// faces further from the camera but may produce false positives.
     /// </summary>
     public int MinFaceSize { get; set; } = 80;
+
+    /// <summary>
+    /// Seconds with face position dropped below baseline before triggering.
+    /// Only fires when face is detected but shifted downward significantly.
+    /// </summary>
+    public int LookingDownThresholdSeconds { get; set; } = 8;
+
+    /// <summary>
+    /// How far the face center must drop (as a fraction of frame height)
+    /// from the baseline position to count as "looking down".
+    /// 0.12 = 12% of frame height (~58px in 480p). Increase if you get
+    /// false positives when typing; decrease if phone use isn't detected.
+    /// </summary>
+    public double FaceDropThreshold { get; set; } = 0.12;
 }

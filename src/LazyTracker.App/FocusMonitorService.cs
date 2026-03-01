@@ -66,15 +66,23 @@ public sealed class FocusMonitorService : BackgroundService
 
     private void OnLookedAway(object? sender, LookedAwayEventArgs e)
     {
+        var reasonText = e.Reason == LookAwayReason.LookingDown
+            ? "LOOKING AT PHONE"
+            : "LOOKED AWAY";
+
         _logger.LogWarning(
-            "👀 LOOKED AWAY for {Seconds:F1}s! Opening McDonald's careers... (trigger #{Count})",
-            e.SecondsAway, e.TotalTriggers);
+            "👀 {Reason} for {Seconds:F1}s! Opening McDonald's careers... (trigger #{Count})",
+            reasonText, e.SecondsAway, e.TotalTriggers);
 
         BrowserLauncher.OpenUrl(_options.TargetUrl);
 
+        var balloonText = e.Reason == LookAwayReason.LookingDown
+            ? $"Put your phone down! ({e.SecondsAway:F0}s). Time #{e.TotalTriggers}."
+            : $"You looked away for {e.SecondsAway:F0}s. Time #{e.TotalTriggers}. Focus!";
+
         _trayManager?.ShowBalloon(
             "Get back to studying!",
-            $"You looked away for {e.SecondsAway:F0}s. Time #{e.TotalTriggers}. Focus!",
+            balloonText,
             isWarning: true);
     }
 
@@ -84,9 +92,13 @@ public sealed class FocusMonitorService : BackgroundService
         {
             _trayManager?.UpdateTooltip("LazyTracker - Paused ⏸️");
         }
-        else if (status.FaceDetected)
+        else if (status.FaceDetected && !status.IsLookingDown)
         {
-            _trayManager?.UpdateTooltip("LazyTracker - Watching 👁️ (face detected)");
+            _trayManager?.UpdateTooltip("LazyTracker - Watching 👁️ (focused)");
+        }
+        else if (status.FaceDetected && status.IsLookingDown)
+        {
+            _trayManager?.UpdateTooltip($"LazyTracker - Looking down! ({status.SecondsAway:F0}s)");
         }
         else if (status.SecondsAway > 0)
         {

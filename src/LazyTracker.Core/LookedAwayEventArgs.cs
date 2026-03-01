@@ -14,4 +14,9 @@ public sealed class LookedAwayEventArgs : EventArgs
     /// The total number of times the user has looked away this session.
     /// </summary>
     public int TotalTriggers { get; init; }
+
+    /// <summary>
+    /// Why the trigger fired.
+    /// </summary>
+    public LookAwayReason Reason { get; init; }
 }
