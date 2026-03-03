@@ -38,6 +38,7 @@ public sealed class FocusMonitorService : BackgroundService
         // Wire up the "looked away" event → open browser
         _watcher.LookedAway += OnLookedAway;
         _watcher.StatusChanged += OnStatusChanged;
+        _watcher.UserReturned += OnUserReturned;
 
         try
         {
@@ -57,6 +58,7 @@ public sealed class FocusMonitorService : BackgroundService
             _logger.LogInformation("Stopping face watcher...");
             _watcher.LookedAway -= OnLookedAway;
             _watcher.StatusChanged -= OnStatusChanged;
+            _watcher.UserReturned -= OnUserReturned;
             _watcher.Stop();
         });
 
@@ -92,6 +94,15 @@ public sealed class FocusMonitorService : BackgroundService
         {
             _trayManager?.UpdateTooltip("LazyTracker - Paused ⏸️");
         }
+        else if (status.State == WatcherState.AutoPaused)
+        {
+            _logger.LogInformation("User left — auto-paused detection.");
+            _trayManager?.UpdateTooltip("LazyTracker - Away (auto-paused) 💤");
+            _trayManager?.ShowBalloon(
+                "Auto-paused 💤",
+                "You left your laptop. Detection paused until you return.",
+                isWarning: false);
+        }
         else if (status.FaceDetected && !status.IsLookingDown)
         {
             _trayManager?.UpdateTooltip("LazyTracker - Watching 👁️ (focused)");
@@ -104,5 +115,15 @@ public sealed class FocusMonitorService : BackgroundService
         {
             _trayManager?.UpdateTooltip($"LazyTracker - No face! ({status.SecondsAway:F0}s)");
         }
+    }
+
+    private void OnUserReturned(object? sender, EventArgs e)
+    {
+        _logger.LogInformation("Welcome back! Detection resumed.");
+        _trayManager?.UpdateTooltip("LazyTracker - Watching 👁️ (focused)");
+        _trayManager?.ShowBalloon(
+            "Welcome back! 📚",
+            "Detection resumed. Time to focus on your studies!",
+            isWarning: false);
     }
 }

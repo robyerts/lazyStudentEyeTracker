@@ -28,6 +28,7 @@ public sealed class FaceWatcher : IDisposable
     private int _totalTriggers;
     private bool _isRunning;
     private bool _isPaused;
+    private bool _isAutoPaused;
     private bool _disposed;
     private readonly object _lock = new();
     private int _frameHeight;
@@ -36,6 +37,10 @@ public sealed class FaceWatcher : IDisposable
     private double _baselineFaceCenterY = -1;
     private readonly Queue<double> _recentFaceCenterYs = new();
     private int _baselineWindowSize;
+
+    // Grace period after resume — suppress looking-down during baseline stabilisation
+    private DateTime _resumeGraceUntil = DateTime.MinValue;
+    private const int ResumeGraceSeconds = 5;
 
     /// <summary>
     /// Fired when the user has been looking away longer than the threshold.
@@ -47,11 +52,19 @@ public sealed class FaceWatcher : IDisposable
     /// </summary>
     public event EventHandler<FaceDetectionStatus>? StatusChanged;
 
+    /// <summary>
+    /// Fired when the user returns after auto-pause (left and came back).
+    /// </summary>
+    public event EventHandler? UserReturned;
+
     /// <summary>Whether the watcher is currently running.</summary>
     public bool IsRunning => _isRunning;
 
-    /// <summary>Whether the watcher is paused.</summary>
-    public bool IsPaused => _isPaused;
+    /// <summary>Whether the watcher is paused (manually or auto).</summary>
+    public bool IsPaused => _isPaused || _isAutoPaused;
+
+    /// <summary>Whether the watcher auto-paused because the user left.</summary>
+    public bool IsAutoPaused => _isAutoPaused;
 
     /// <summary>Total number of "looked away" triggers this session.</summary>
     public int TotalTriggers => _totalTriggers;
@@ -101,6 +114,7 @@ public sealed class FaceWatcher : IDisposable
             _baselineWindowSize = Math.Max(5, _options.DetectionFps * 3); // 3 seconds of baseline
             _isRunning = true;
             _isPaused = false;
+            _isAutoPaused = false;
 
             var intervalMs = 1000 / Math.Max(1, _options.DetectionFps);
             _timer = new Timer(DetectionTick, null, 0, intervalMs);
@@ -141,10 +155,7 @@ public sealed class FaceWatcher : IDisposable
     public void Resume()
     {
         _isPaused = false;
-        _lastFaceSeen = DateTime.UtcNow;
-        _lastAttentiveTime = DateTime.UtcNow;
-        _baselineFaceCenterY = -1;
-        _recentFaceCenterYs.Clear();
+        ResetBaseline();
         StatusChanged?.Invoke(this, new FaceDetectionStatus
         {
             FaceDetected = true,
@@ -152,9 +163,29 @@ public sealed class FaceWatcher : IDisposable
         });
     }
 
+    /// <summary>Resets tracking state and optionally preserves the baseline.</summary>
+    private void ResetBaseline(bool preserveBaseline = false)
+    {
+        _lastFaceSeen = DateTime.UtcNow;
+        _lastAttentiveTime = DateTime.UtcNow;
+        if (!preserveBaseline)
+        {
+            _baselineFaceCenterY = -1;
+            _recentFaceCenterYs.Clear();
+        }
+        _resumeGraceUntil = DateTime.UtcNow.AddSeconds(ResumeGraceSeconds);
+    }
+
     private void DetectionTick(object? state)
     {
         if (_isPaused || _disposed) return;
+
+        // When auto-paused, still look for face to detect the user returning
+        if (_isAutoPaused)
+        {
+            DetectReturnFromAutoPause();
+            return;
+        }
 
         lock (_lock)
         {
@@ -206,8 +237,9 @@ public sealed class FaceWatcher : IDisposable
                     }
 
                     // Check if face has shifted significantly downward
+                    // (suppressed during grace period after resume)
                     bool isLookingDown = false;
-                    if (_baselineFaceCenterY > 0)
+                    if (_baselineFaceCenterY > 0 && now > _resumeGraceUntil)
                     {
                         double dropAmount = normalizedY - _baselineFaceCenterY;
                         // Drop threshold as % of frame height (default 0.12 = ~58px in 480p)
@@ -268,6 +300,20 @@ public sealed class FaceWatcher : IDisposable
                     // No face at all — turned away or left
                     var secondsAway = (now - _lastFaceSeen).TotalSeconds;
 
+                    // Check if user has been gone long enough to auto-pause
+                    if (_options.AutoPauseSeconds > 0 && secondsAway >= _options.AutoPauseSeconds)
+                    {
+                        _isAutoPaused = true;
+                        StatusChanged?.Invoke(this, new FaceDetectionStatus
+                        {
+                            FaceDetected = false,
+                            IsLookingDown = false,
+                            State = WatcherState.AutoPaused,
+                            SecondsAway = secondsAway
+                        });
+                        return;
+                    }
+
                     StatusChanged?.Invoke(this, new FaceDetectionStatus
                     {
                         FaceDetected = false,
@@ -299,6 +345,53 @@ public sealed class FaceWatcher : IDisposable
             {
                 // Swallow frame processing errors to keep the loop alive.
                 // Camera hiccups, transient OpenCV errors, etc.
+            }
+        }
+    }
+
+    private void DetectReturnFromAutoPause()
+    {
+        lock (_lock)
+        {
+            if (!_isRunning || _capture == null || _disposed) return;
+
+            try
+            {
+                using var frame = new Mat();
+                if (!_capture.Read(frame) || frame.Empty())
+                    return;
+
+                using var gray = new Mat();
+                Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
+                Cv2.EqualizeHist(gray, gray);
+
+                var faces = _faceCascade.DetectMultiScale(
+                    image: gray,
+                    scaleFactor: 1.1,
+                    minNeighbors: 4,
+                    flags: HaarDetectionTypes.ScaleImage,
+                    minSize: new Size(_options.MinFaceSize, _options.MinFaceSize));
+
+                if (faces.Length > 0)
+                {
+                    // User is back! Resume with the saved baseline position.
+                    _isAutoPaused = false;
+                    ResetBaseline(preserveBaseline: true);
+
+                    StatusChanged?.Invoke(this, new FaceDetectionStatus
+                    {
+                        FaceDetected = true,
+                        IsLookingDown = false,
+                        State = WatcherState.Watching,
+                        SecondsAway = 0
+                    });
+
+                    UserReturned?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            catch (Exception)
+            {
+                // Swallow frame errors
             }
         }
     }
@@ -393,5 +486,6 @@ public enum WatcherState
 {
     Watching,
     Paused,
+    AutoPaused,
     Stopped
 }

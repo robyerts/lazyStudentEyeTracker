@@ -51,4 +51,12 @@ public sealed class LazyTrackerOptions
     /// false positives when typing; decrease if phone use isn't detected.
     /// </summary>
     public double FaceDropThreshold { get; set; } = 0.12;
+
+    /// <summary>
+    /// Seconds with no face detected before the watcher automatically pauses.
+    /// This prevents repeated triggers when you leave the laptop.
+    /// When you return, detection resumes and a notification is shown.
+    /// Set to 0 to disable auto-pause.
+    /// </summary>
+    public int AutoPauseSeconds { get; set; } = 30;
 }
